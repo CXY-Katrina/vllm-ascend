@@ -98,11 +98,15 @@ def _sparse_attn_num_stages_kwarg() -> dict:
 
 def _prune_decode_score_configs(configs, named_args, **_):
     """Keeps decode split-K launches within the configured program budget."""
-    request_count = max(1, named_args["num_reqs"])
-    chunk_limit = max(1, 512 // request_count)
-    chunk_limit = 1 << (chunk_limit.bit_length() - 1)
+    chunk_limit = _decode_score_chunk_limit(named_args["num_reqs"])
     valid_configs = [config for config in configs if config.kwargs["num_kv_chunks"] <= chunk_limit]
     return valid_configs or configs[:1]
+
+
+def _decode_score_chunk_limit(num_reqs: int) -> int:
+    request_count = max(1, num_reqs)
+    chunk_limit = max(1, 512 // request_count)
+    return 1 << (chunk_limit.bit_length() - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +589,94 @@ def _decode_index_score_kernel(
         score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
         tl.store(
             score_ptr + h_offsets * stride_s_h + q_ids * stride_s_n + blk * stride_s_k,
+            score,
+            mask=q_mask,
+        )
+
+
+@triton.jit(do_not_specialize=["decode_query_len", "block_offset", "shard_block_count"])
+def _decode_index_partial_topk_kernel(
+    q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
+    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
+    score_ptr,  # shard scores: [num_idx_heads, total_q, shard_score_stride]
+    block_table_ptr,  # [num_reqs, shard_block_count]
+    seq_lens,  # local sequence lengths inside this block shard, [num_reqs]
+    global_seq_lens,  # full sequence lengths, [num_reqs]
+    num_idx_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    num_reqs: tl.constexpr,
+    block_offset,
+    decode_query_len,
+    shard_block_count,
+    init_blocks: tl.constexpr,
+    local_blocks: tl.constexpr,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_ik_blk,
+    stride_ik_pos,
+    stride_ik_d,
+    stride_s_h,
+    stride_s_n,
+    stride_s_k,
+    stride_bt_b,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    num_kv_chunks: tl.constexpr,
+):
+    BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
+    pid_r = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    hq_offsets = tl.arange(0, BLOCK_SIZE_HQ)
+    h_offsets = hq_offsets // BLOCK_SIZE_Q
+    q_offsets = hq_offsets % BLOCK_SIZE_Q
+    q_mask = q_offsets < decode_query_len
+    q_ids = pid_r * decode_query_len + q_offsets
+
+    local_seq_len = tl.load(seq_lens + pid_r)
+    global_seq_len = tl.load(global_seq_lens + pid_r)
+    query_pos = global_seq_len - decode_query_len + q_offsets
+    kv_len = tl.maximum(query_pos + 1, 0)
+    local_kv_len = tl.minimum(tl.maximum(kv_len - block_offset * BLOCK_SIZE_K, 0), local_seq_len)
+    local_kv_len_max = tl.max(tl.where(q_mask, local_kv_len, 0), axis=0)
+    visible_blocks = (local_kv_len_max + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    visible_blocks = tl.minimum(visible_blocks, shard_block_count)
+
+    chunk_size_blocks = (visible_blocks + num_kv_chunks - 1) // num_kv_chunks
+    chunk_start_block = pid_c * chunk_size_blocks
+    chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, visible_blocks)
+    if chunk_start_block >= chunk_end_block:
+        return
+
+    off_k = tl.arange(0, BLOCK_SIZE_K)
+    off_d = tl.arange(0, head_dim)
+    bt_row = block_table_ptr + pid_r * stride_bt_b
+    q = tl.load(
+        q_ptr + q_ids[:, None] * stride_q_n + h_offsets[:, None] * stride_q_h + off_d[None, :] * stride_q_d,
+        mask=q_mask[:, None],
+        other=0.0,
+    )
+
+    num_blocks_q = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    local_start = tl.maximum(0, num_blocks_q - local_blocks)
+    for local_blk in tl.range(chunk_start_block, chunk_end_block):
+        page = tl.load(bt_row + local_blk).to(tl.int64)
+        global_blk = block_offset + local_blk
+        pos = global_blk * BLOCK_SIZE_K + off_k
+        pos_mask = pos[None, :] <= query_pos[:, None]
+        k = tl.load(
+            ik_cache_ptr + page * stride_ik_blk + off_k[None, :] * stride_ik_pos + off_d[:, None] * stride_ik_d,
+        )
+        qk = tl.dot(q, k, out_dtype=tl.float32)
+        qk = tl.where(pos_mask & q_mask[:, None], qk, float("-inf"))
+        score = tl.max(qk, axis=1)
+
+        is_visible_block = global_blk < num_blocks_q
+        is_init = (global_blk < init_blocks) & is_visible_block
+        is_local = (global_blk >= local_start) & is_visible_block
+        score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
+        tl.store(
+            score_ptr + h_offsets * stride_s_h + q_ids * stride_s_n + local_blk * stride_s_k,
             score,
             mask=q_mask,
         )
@@ -1654,95 +1746,133 @@ def minimax_m3_index_decode(
         device=idx_q.device,
     )
 
-    init_mask = torch.zeros(
-        (total_query_tokens, score_block_stride),
-        dtype=torch.bool,
-        device=seq_lens.device,
-    )
-    local_mask = torch.zeros_like(init_mask)
-    mask_chunk_count = max(
-        1,
-        min(16, 64 // max(1, total_query_tokens)),
-    )
-    mask_chunk_blocks = triton.cdiv(max_block_count, mask_chunk_count)
-    _prepare_decode_score_masks_kernel[(total_query_tokens, mask_chunk_count)](
-        init_mask,
-        local_mask,
-        seq_lens,
-        global_seq_lens,
-        SPARSE_BLOCK_SIZE,
-        max_block_count,
-        block_offset,
-        decode_query_len,
-        mask_chunk_blocks,
-        init_blocks,
-        local_blocks,
-        init_mask.stride(0),
-        init_mask.stride(1),
-        BLOCK_SIZE_K=2048,
-    )
-
-    use_pdl = current_platform.is_arch_support_pdl()
-    launch_kwargs = {"launch_pdl": True} if use_pdl else {}
     decode_query_tile_size = triton.next_power_of_2(max_decode_query_len)
-    decode_score_grid = lambda metadata: (
-        request_count,
-        metadata["num_kv_chunks"],
-    )
-    _decode_index_score_kernel[decode_score_grid](
-        idx_q,
-        index_kv_cache,
-        score,
-        init_mask,
-        local_mask,
-        block_table,
-        seq_lens,
-        global_seq_lens,
-        index_head_count,
-        head_dim,
-        request_count,
-        block_offset,
-        decode_query_len,
-        idx_q.stride(0),
-        idx_q.stride(1),
-        idx_q.stride(2),
-        index_kv_cache.stride(0),
-        index_kv_cache.stride(1),
-        index_kv_cache.stride(2),
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        init_mask.stride(0),
-        init_mask.stride(1),
-        block_table.stride(0),
-        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        BLOCK_SIZE_Q=decode_query_tile_size,
-        USE_PDL=use_pdl,
-        **launch_kwargs,
-    )
+    if block_count is not None:
+        score.fill_(float("-inf"))
+        decode_score_chunk_count = min(
+            max_block_count,
+            _decode_score_chunk_limit(request_count),
+        )
+        if decode_score_chunk_count > 0:
+            _decode_index_partial_topk_kernel[(request_count, decode_score_chunk_count)](
+                idx_q,
+                index_kv_cache,
+                score,
+                block_table,
+                seq_lens,
+                global_seq_lens,
+                index_head_count,
+                head_dim,
+                request_count,
+                block_offset,
+                decode_query_len,
+                max_block_count,
+                init_blocks,
+                local_blocks,
+                idx_q.stride(0),
+                idx_q.stride(1),
+                idx_q.stride(2),
+                index_kv_cache.stride(0),
+                index_kv_cache.stride(1),
+                index_kv_cache.stride(2),
+                score.stride(0),
+                score.stride(1),
+                score.stride(2),
+                block_table.stride(0),
+                BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+                BLOCK_SIZE_Q=decode_query_tile_size,
+                num_kv_chunks=decode_score_chunk_count,
+                num_stages=1,
+            )
+    else:
+        init_mask = torch.zeros(
+            (total_query_tokens, score_block_stride),
+            dtype=torch.bool,
+            device=seq_lens.device,
+        )
+        local_mask = torch.zeros_like(init_mask)
+        mask_chunk_count = max(
+            1,
+            min(16, 64 // max(1, total_query_tokens)),
+        )
+        mask_chunk_blocks = triton.cdiv(max_block_count, mask_chunk_count)
+        _prepare_decode_score_masks_kernel[(total_query_tokens, mask_chunk_count)](
+            init_mask,
+            local_mask,
+            seq_lens,
+            global_seq_lens,
+            SPARSE_BLOCK_SIZE,
+            max_block_count,
+            block_offset,
+            decode_query_len,
+            mask_chunk_blocks,
+            init_blocks,
+            local_blocks,
+            init_mask.stride(0),
+            init_mask.stride(1),
+            BLOCK_SIZE_K=2048,
+        )
 
-    tail_chunk_count = max(
-        1,
-        min(
-            16,
-            64 // max(1, total_query_tokens * index_head_count),
-        ),
-    )
-    tail_chunk_blocks = triton.cdiv(max_block_count, tail_chunk_count)
-    _fill_decode_score_tail_kernel[(total_query_tokens, index_head_count, tail_chunk_count)](
-        score,
-        seq_lens,
-        global_seq_lens,
-        SPARSE_BLOCK_SIZE,
-        max_block_count,
-        block_offset,
-        decode_query_len,
-        tail_chunk_blocks,
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        BLOCK_SIZE_K=2048,
-    )
+        use_pdl = current_platform.is_arch_support_pdl()
+        launch_kwargs = {"launch_pdl": True} if use_pdl else {}
+        decode_score_grid = lambda metadata: (
+            request_count,
+            metadata["num_kv_chunks"],
+        )
+        _decode_index_score_kernel[decode_score_grid](
+            idx_q,
+            index_kv_cache,
+            score,
+            init_mask,
+            local_mask,
+            block_table,
+            seq_lens,
+            global_seq_lens,
+            index_head_count,
+            head_dim,
+            request_count,
+            block_offset,
+            decode_query_len,
+            idx_q.stride(0),
+            idx_q.stride(1),
+            idx_q.stride(2),
+            index_kv_cache.stride(0),
+            index_kv_cache.stride(1),
+            index_kv_cache.stride(2),
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            init_mask.stride(0),
+            init_mask.stride(1),
+            block_table.stride(0),
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            BLOCK_SIZE_Q=decode_query_tile_size,
+            USE_PDL=use_pdl,
+            **launch_kwargs,
+        )
+
+        tail_chunk_count = max(
+            1,
+            min(
+                16,
+                64 // max(1, total_query_tokens * index_head_count),
+            ),
+        )
+        tail_chunk_blocks = triton.cdiv(max_block_count, tail_chunk_count)
+        _fill_decode_score_tail_kernel[(total_query_tokens, index_head_count, tail_chunk_count)](
+            score,
+            seq_lens,
+            global_seq_lens,
+            SPARSE_BLOCK_SIZE,
+            max_block_count,
+            block_offset,
+            decode_query_len,
+            tail_chunk_blocks,
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            BLOCK_SIZE_K=2048,
+        )
 
     selected_count = min(topk, max_block_count)
     score_rows = score[:, :total_query_tokens, :max_block_count]

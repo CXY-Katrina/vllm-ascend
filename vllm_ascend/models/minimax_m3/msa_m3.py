@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn.parameter import Parameter
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -336,17 +337,32 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         tp_size: int,
         tp_rank: int,
     ) -> torch.Tensor:
-        full_idx_q = tp_group.all_gather(idx_q.contiguous(), dim=1)
+        local_head_count = idx_q.shape[1]
+        local_head_start = tp_rank * local_head_count
+        local_head_end = local_head_start + local_head_count
+
+        full_idx_q = idx_q.new_zeros(
+            idx_q.shape[0],
+            local_head_count * tp_size,
+            idx_q.shape[2],
+        )
+        full_idx_q[:, local_head_start:local_head_end, :].copy_(idx_q)
+        dist.all_reduce(full_idx_q, group=tp_group.device_group)
 
         max_block_count = (max_seq_len + self.block_size - 1) // self.block_size
         blocks_per_tp = (max_block_count + tp_size - 1) // tp_size
         block_offset = tp_rank * blocks_per_tp
-        block_count = max(0, min(blocks_per_tp, max_block_count - block_offset))
-        local_block_table = block_table[:, block_offset : block_offset + block_count].contiguous()
+        valid_block_count = max(0, min(blocks_per_tp, max_block_count - block_offset))
+        local_block_table = block_table.new_zeros((block_table.shape[0], blocks_per_tp))
+        if valid_block_count > 0:
+            local_block_table[:, :valid_block_count].copy_(
+                block_table[:, block_offset : block_offset + valid_block_count]
+            )
+        local_block_table = local_block_table.contiguous()
         local_seq_lens = torch.clamp(
             seq_lens - block_offset * self.block_size,
             min=0,
-            max=block_count * self.block_size,
+            max=blocks_per_tp * self.block_size,
         )
 
         local_topk, local_scores = minimax_m3_index_decode(
@@ -362,23 +378,35 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
             decode_query_len,
             sm_scale=self.scale,
             block_offset=block_offset,
-            block_count=block_count,
+            block_count=blocks_per_tp,
             global_seq_lens=seq_lens,
             return_scores=True,
         )
-        gathered_scores = tp_group.all_gather(local_scores.contiguous(), dim=-1)
-        gathered_topk = tp_group.all_gather(local_topk.contiguous(), dim=-1)
+        local_topk_start = tp_rank * self.topk_blocks
+        local_topk_end = local_topk_start + self.topk_blocks
+        gathered_scores = local_scores.new_zeros(
+            local_scores.shape[0],
+            local_scores.shape[1],
+            self.topk_blocks * tp_size,
+        )
+        gathered_scores[:, :, local_topk_start:local_topk_end].copy_(local_scores)
+        dist.all_reduce(gathered_scores, group=tp_group.device_group)
+
+        gathered_topk = local_scores.new_zeros(gathered_scores.shape)
+        gathered_topk[:, :, local_topk_start:local_topk_end].copy_(
+            local_topk.to(gathered_topk.dtype)
+        )
+        dist.all_reduce(gathered_topk, group=tp_group.device_group)
         merged_scores, merged_pos = torch.topk(
             gathered_scores,
             k=self.topk_blocks,
             dim=-1,
         )
-        merged_topk = torch.gather(gathered_topk, dim=-1, index=merged_pos).to(torch.int32)
+        merged_topk = torch.gather(gathered_topk, dim=-1, index=merged_pos).to(
+            torch.int32
+        )
         merged_topk = torch.where(merged_scores > float("-inf"), merged_topk, -1)
 
-        local_head_count = idx_q.shape[1]
-        local_head_start = tp_rank * local_head_count
-        local_head_end = local_head_start + local_head_count
         return merged_topk[local_head_start:local_head_end, :, :].contiguous()
 
     def forward(

@@ -24,7 +24,7 @@ Refer to the [feature guide](../../user_guide/feature_guide/index.md) for featur
 ### 3.1 Model Weight
 
 The `MiniMax-M3` BF16 model requires one Ascend 910C server with 16 × 64 GB NPU chips. [Download the model weights](https://www.modelscope.cn/collections/MiniMax/MiniMax-M3).
-
+We also provide `W8A8` quant model requires 1 Ascend 910C (with 8 x 64G NPUs). [Download the model weights](https://www.modelscope.cn/models/Eco-Tech/MiniMax-M3-w8a8-0626)
 It is recommended to place the model weight in a shared cache directory.
 
 ### 3.2 Verify Multi-node Communication (Optional)
@@ -82,6 +82,15 @@ For multi-node deployment, verify the communication environment by following [Ve
   -it $IMAGE bash
   ```
 
+- Step 3: compile Rust frontend
+  ```bash
+  cd /vllm-workspace/vllm
+
+  # Install _rust_tool_parser for the Rust frontend.
+  pip install setuptools-rust
+  ./build_rust.sh
+  ```
+
 ## 5 Online Service Deployment
 
 Start the online serving service with the following command:
@@ -90,26 +99,36 @@ Start the online serving service with the following command:
 
 #### 5.1.1 BF16 Deployment
 
-  ```bash
-  export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
-  export HCCL_OP_EXPANSION_MODE="AIV"
-  export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+```bash
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 
-  vllm serve ${WEIGHT_PATH} \
-    --served-model-name minimax-m3 \
-    --trust-remote-code \
-    --max-model-len 43008 \
-    --tensor-parallel-size 16 \
-    --enable-expert-parallel \
-    --max-num-seqs 16 \
-    --distributed_executor_backend "mp" \
-    --gpu-memory-utilization 0.92 \
-    --reasoning-parser minimax_m3 \
-    --limit-mm-per-prompt '{"image":1}' \
-    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": true, "weight_nz_mode": 2}' \
-    --port 11223 > ${LOG_PATH} 2>&1 &
-  ```
+vllm serve ${WEIGHT_PATH} \
+  --served-model-name minimax-m3 \
+  --trust-remote-code \
+  --max-model-len 43008 \
+  --tensor-parallel-size 16 \
+  --enable-expert-parallel \
+  --max-num-seqs 16 \
+  --distributed_executor_backend "mp" \
+  --gpu-memory-utilization 0.92 \
+  --reasoning-parser minimax_m3 \
+  --limit-mm-per-prompt '{"image":1}' \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --additional-config '{
+      "enable_cpu_binding": true,
+      "ascend_compilation_config": {
+      "enable_static_kernel": true,
+      "fuse_norm_quant": false
+      },
+      "multistream_overlap_shared_expert": true,
+      "weight_nz_mode": 2,
+      "enable_flashcomm1": true,
+      "enable_reduce_sample": true
+  }' \
+  --port 11223 > ${LOG_PATH} 2>&1 &
+```
 
 #### 5.1.2 W8A8 Deployment
 
@@ -122,16 +141,30 @@ Start the online serving service with the following command:
   --served-model-name minimax-m3 \
   --trust-remote-code \
   --max-model-len 131072 \
-  --tensor-parallel-size 16 \
+  --tensor-parallel-size 4 \
+  --data-parallel-size 4 --api_server_count 1 \
+  --max-num-batched-tokens 32768 \
+  --long-prefill-token-threshold 4096 \
   --enable-expert-parallel \
-  --max-num-seqs 16 \
+  --max-num-seqs 32 \
   --distributed_executor_backend "mp" \
   --gpu-memory-utilization 0.92 \
   --reasoning-parser minimax_m3 \
   --limit-mm-per-prompt '{"image":1}' \
   --speculative-config '{"model":"${EAGLE3_WEIGHT_PATH}", "method":"eagle3", "num_speculative_tokens":3}' \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-  --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant": true}, "multistream_overlap_shared_expert": true, "weight_nz_mode": 2}' \
+  --additional-config '{
+      "enable_cpu_binding": true,
+      "ascend_compilation_config": {
+        "enable_static_kernel": true,
+        "fuse_norm_quant": false
+      },
+      "multistream_overlap_shared_expert": true,
+      "enable_shared_expert_dp": true,
+      "weight_nz_mode": 2,
+      "enable_flashcomm1": true,
+      "enable_reduce_sample": true
+  }' \
   --port 11223 > ${LOG_PATH} 2>&1 &
   ```
 
@@ -226,7 +259,7 @@ The examples below use Ascend A2 servers. Update `WEIGHT_PATH`, `EAGLE3_WEIGHT_P
     --reasoning-parser minimax_m3 \
     --limit-mm-per-prompt '{"image":1}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": true, "weight_nz_mode": 2}' \
+    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": false, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": true, "weight_nz_mode": 2}' \
     --port 11223 > ${LOG_PATH} 2>&1 &
   ```
 
@@ -270,7 +303,7 @@ The examples below use Ascend A2 servers. Update `WEIGHT_PATH`, `EAGLE3_WEIGHT_P
     --reasoning-parser minimax_m3 \
     --limit-mm-per-prompt '{"image":1}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": true, "weight_nz_mode": 2}' \
+    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": false, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": true, "weight_nz_mode": 2}' \
     --port 11223 > ${LOG_PATH} 2>&1 &
   ```
 
@@ -316,7 +349,8 @@ The examples below use Ascend A2 servers. Update `WEIGHT_PATH`, `EAGLE3_WEIGHT_P
     --limit-mm-per-prompt '{"image":1}' \
     --speculative-config '{"model":"${EAGLE3_WEIGHT_PATH}", "method":"eagle3", "num_speculative_tokens":3}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": false, "weight_nz_mode": 2}' \
+    --additional-config 
+    '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": false, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": false, "weight_nz_mode": 2, "flash_common1": true}' \
     --port 11223 > ${LOG_PATH} 2>&1 &
   ```
 
@@ -361,7 +395,7 @@ The examples below use Ascend A2 servers. Update `WEIGHT_PATH`, `EAGLE3_WEIGHT_P
     --limit-mm-per-prompt '{"image":1}' \
     --speculative-config '{"model":"${EAGLE3_WEIGHT_PATH}", "method":"eagle3", "num_speculative_tokens":3}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": false, "weight_nz_mode": 2}' \
+    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": false, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": false, "weight_nz_mode": 2, "enable_flashcomm1": true}' \
     --port 11223 > ${LOG_PATH} 2>&1 &
   ```
 
@@ -642,7 +676,9 @@ For detailed instructions, refer to [Using AISBench for accuracy evaluation](../
 | GSM8K   | GPU      | 96.72 | 65536         | 16           | 49152       | 16         | temperature=1.0, top_p=0.95 |
 | GSM8K   | NPU      | 96.36 | 10240         | 16           | 9500        | 20         | temperature=1.0, top_p=0.95 |
 | AIME2025 | GPU     | 95@repeat4 | -        | -            | -           | -          | -                 |
-| AIME2025 | NPU     | 90    | -             | -            | -           | -          | temperature=1.0, top_p=0.95 |
+| AIME2025 | NPU     | 93.3@repeat2    | 131072        | 32         | 65536           | 8         | temperature=1.0, top_p=0.95 |
+| GPQA-Diamond | GPU     | 92.42    | 81920      | 64        | 75776       | 8       | temperature=0.6, top_p=0.95 |
+| GPQA-Diamond | NPU     | 92.42    | 131072      | 32        | 65536       | 8       | temperature=0.6, top_p=0.95 |
 
 ### 8.3 Multimodal Evaluation
 

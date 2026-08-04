@@ -723,48 +723,6 @@ ais_bench \
   pip install -v --no-build-isolation -e . -i http://mirrors.aliyun.com/pypi/simple --trusted-host mirrors.aliyun.com
   ```
 
-- **Q: How can I resolve `TypeError: _LazyConfigMapping.__init__() missing 1 required positional argument: 'mapping'`?**
-
-  The full error is as follows:
-
-  ```text
-  Traceback (most recent call last):
-  File "<string>", line 1, in <module>
-  File "/usr/local/python3.12.13/lib/python3.12/multiprocessing/spawn.py", line 122, in spawn_main
-    exitcode = _main(fd, parent_sentinel)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/python3.12.13/lib/python3.12/multiprocessing/spawn.py", line 132, in _main
-    self = reduction.pickle.load(from_parent)
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  TypeError: _LazyConfigMapping.__init__() missing 1 required positional argument: 'mapping'
-  ```
-
-  A: Edit `configuration_minimax_m3_vl.py` in the model weights. Comment out `from transformers.models.auto import CONFIG_MAPPING` at module scope and move the import to the call site, as shown below:
-
-  ```python
-  from transformers.configuration_utils import PretrainedConfig
-  # from transformers.models.auto import CONFIG_MAPPING
-
-
-  def _coerce_sub_config(
-      sub_config: Optional[dict], default_model_type: str
-  ) -> Optional[PretrainedConfig]:
-      """Convert a config dict to a ``PretrainedConfig`` instance.
-
-      If ``model_type`` is registered in HF ``CONFIG_MAPPING`` the corresponding
-      config class is used; otherwise we fall back to a generic
-      ``PretrainedConfig`` so all dict keys still become real attributes (M3's
-      text backbone uses ``model_type="minimax_m2"`` which is not in
-      ``CONFIG_MAPPING``).
-      """
-      if not isinstance(sub_config, dict):
-          return sub_config
-      model_type = sub_config.get("model_type", default_model_type)
-      from transformers.models.auto import CONFIG_MAPPING
-      cls = CONFIG_MAPPING.get(model_type, PretrainedConfig)
-      return cls(**sub_config)
-  ```
-
 - **Q: What should I do if a video request is slow or times out when `media_io_kwargs.video.num_frames` is not set?**
 
   A: By default, vLLM samples 32 frames when reading a video. MiniMax-M3 produces many visual tokens per frame, so a 32-frame video significantly increases prefill computation. If the request is slow or times out, explicitly set `media_io_kwargs.video.num_frames` to a smaller value, such as 8 or 16 frames:

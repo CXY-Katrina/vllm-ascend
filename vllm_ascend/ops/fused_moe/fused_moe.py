@@ -182,7 +182,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     ) -> torch.Tensor:
         if output_is_reduced is None:
             output_is_reduced = self._fused_output_is_reduced
-        if not output_is_reduced:
+        # MC2 profiling can capture this graph before an AllGather prefill.
+        # Without shared experts or an output transform, keep the custom op
+        # in the graph so it decides whether to reduce at execution time.
+        if (self.ascend_shared_experts is None and self.routed_output_transform is None) or not output_is_reduced:
             states = torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(states)
         if trunc_size is not None and trunc_size > 0:
             return states[..., :trunc_size]

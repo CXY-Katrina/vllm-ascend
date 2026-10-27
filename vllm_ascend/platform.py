@@ -1663,6 +1663,8 @@ def _validate_flash_attn_backend(backend_key, selector) -> bool:
     spec = config.speculative_config if config is not None else None
     if spec is None or not spec.enforce_eager:
         return False
+    if backends.model_tag == "dspark_head":
+        return _validate_minimax_dspark_flash_attn(config, selector)
     # V2 keeps the target model_config while loading the draft. Read the live
     # loader tag rather than relying on V1's runner_type="draft" convention.
     if backends.model_tag != "dflash_head":
@@ -1687,6 +1689,38 @@ def _validate_flash_attn_backend(backend_key, selector) -> bool:
             or selector.use_per_head_quant_scales
         )
     )
+
+def _validate_minimax_dspark_flash_attn(config, selector) -> bool:
+    """Preserve the MiniMax eager draft guards alongside main's DFlash backend."""
+    from vllm.v1.attention.backend import AttentionType
+
+    spec = config.speculative_config
+    if spec.method != "dspark":
+        return False
+    if spec.target_model_config.hf_text_config.model_type != "minimax_m3_text":
+        return False
+    if not {"MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"}.intersection(spec.draft_model_config.architectures or []):
+        return False
+    parallel = config.parallel_config
+    return (
+        parallel.pipeline_parallel_size == 1
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.decode_context_parallel_size == 1
+        and not getattr(spec, "enable_adaptive_verification", False)
+        and selector.attn_type == AttentionType.DECODER
+        and selector.dtype in (torch.float16, torch.bfloat16)
+        and selector.kv_cache_dtype in (None, "auto", "float16", "bfloat16")
+        and not (
+            getattr(selector, "use_pcp", False)
+            or selector.use_dcp
+            or selector.use_mm_prefix
+            or selector.use_per_head_quant_scales
+            or selector.use_batch_invariant
+            or getattr(selector, "use_rswa", False)
+            or getattr(selector, "use_adaptive_verification", False)
+        )
+    )
+
 
 
 def _validate_fa3_backend(key, _attn_selector_config):

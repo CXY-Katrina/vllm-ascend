@@ -66,6 +66,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     fill_mxfp_v_scale_cache,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
 from vllm_ascend.attention.flashmla import prepare_flashmla_batch_req_state
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
@@ -1256,7 +1257,7 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def _can_skip_spec_cpu_length_sync(self) -> bool:
-        """Allow device lengths for GLM-5.3 with a DFlash2 draft."""
+        """Allow device lengths when every active speculative backend supports them."""
         if self.sync_spec_pp_cpu_counts:
             return False
 
@@ -1273,7 +1274,28 @@ class NPUModelRunner(GPUModelRunner):
             and "DFlash2DraftModel" in (spec.draft_model_config.architectures or [])
         ):
             return True
-        return False
+        spec = self.speculative_config
+        if (
+            spec is None
+            or self.speculator is None
+            or spec.method != "dspark"
+            or self.model_config.hf_text_config.model_type != "minimax_m3_text"
+            or spec.draft_model_config is None
+            or not {"MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"}.intersection(
+                spec.draft_model_config.architectures or []
+            )
+        ):
+            return False
+
+        backends = [group.backend for groups in self.attn_groups for group in groups]
+        # Keep the target's sparse implementation unchanged: decode uses exact
+        # device lengths; prefill independently reads them for host block counts.
+        # A target GQA layer using the old backend still needs the shared mirror.
+        return AscendFlashAttentionBackend in backends and all(
+            backend is AscendFlashAttentionBackend
+            or backend.get_name() in ("ASCEND_MINIMAX_M3_SPARSE", "ASCEND_MINIMAX_M3_SPARSE_INDEXER")
+            for backend in backends
+        )
 
     def postprocess_sampled(
         self,

@@ -1,0 +1,6 @@
+pr: 5
+entries:
+  - category: bugfix
+    text: >-
+      Fixed MiniMax MXFP8 overlap preparation for quantized inputs, legacy vision checkpoint
+      name mapping, and model scale-policy handling in MoE dispatch, fallback and combine.

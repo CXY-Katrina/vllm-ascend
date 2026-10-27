@@ -1,0 +1,4 @@
+pr: 3
+entries:
+  - category: bugfix
+    text: Fixed MiniMax FP8 GBSA softmax precision, prepared MXFP8 overlap inputs, legacy vision checkpoint names, and MXFP8 activation and combine precision.

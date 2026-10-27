@@ -1,0 +1,7 @@
+pr: 7
+entries:
+  - category: feature
+    text: >-
+      Integrated native MiniMax DSpark BF16 and MXFP8 draft loading with the main
+      A5 runtime, preserving DFlash backend selection and pipeline-parallel
+      sequence-length synchronization while enabling CANN FlashAttn drafts.

@@ -66,6 +66,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     fill_mxfp_v_scale_cache,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
 from vllm_ascend.attention.flashmla import prepare_flashmla_batch_req_state
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
@@ -107,7 +108,6 @@ from vllm_ascend.utils import (
     lmhead_tp_pad_rows,
     set_potential_max_tokens,
     should_skip_allreduce_across_dp_group,
-    vllm_version_is,
 )
 from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
 from vllm_ascend.worker.utils import disable_compilation
@@ -123,7 +123,6 @@ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
 from vllm_ascend.worker.v2.spec_decode import init_speculator
-from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import (
     AscendV2KVBlockZeroer,
@@ -212,17 +211,8 @@ class NPUModelRunner(GPUModelRunner):
         del self.input_buffers
         del self.speculator
 
-        # we define AscendEagleSpeculator in vllm_ascend.worker.v2.spec_decode.eagle.speculator
-        # init_speculator will return AscendEagleSpeculator when eagle is used.
-        # so here we just call init_speculator to reinitialize speculator.
-        self.speculator: AscendEagleSpeculator | None = None
         self.pd_dspark_aux_layer_ids: tuple[int, ...] = ()
         self._dspark_prefill_progress: dict[str, tuple[str, int]] = {}
-        if self.speculative_config is not None and self.is_last_pp_rank:
-            self.speculator = init_speculator(self.vllm_config, self.device)
-            # Shared update_stream: main model (ModelAclGraphManager) and draft
-            # (Eagle/DFlash/DSpark AclGraphManager) all use this same stream.
-            self.speculator.update_stream = self.update_stream
 
         # AscendRequestState has extra `num_computed_tokens_cpu` attribute.
         # so reinitialize req_states here.
@@ -233,7 +223,19 @@ class NPUModelRunner(GPUModelRunner):
             num_speculative_steps=self.num_speculative_steps,
             vocab_size=self.vocab_size,
             device=self.device,
+            use_dense_all_token_ids=(
+                self.speculative_config is not None and self.speculative_config.method in ("ngram", "ngram_gpu")
+            ),
         )
+        # The upstream speculator was constructed with the discarded upstream
+        # request state. This construction does not use that speculator: it
+        # binds n-gram to the new state and selects Ascend implementations for
+        # model-based methods through the Ascend factory.
+        self.speculator: Any = None
+        if self.speculative_config is not None and self.is_last_pp_rank:
+            self.speculator = init_speculator(self.vllm_config, self.device, self.req_states)
+            # Share the update stream between the target and draft graph managers.
+            self.speculator.update_stream = self.update_stream
         # AscendInputBuffers has extra `seq_lens_cpu` attribute.
         # so reinitialize input_buffers here.
         self.input_buffers: AscendInputBuffers = AscendInputBuffers(
@@ -1131,17 +1133,15 @@ class NPUModelRunner(GPUModelRunner):
                 grammar_output.structured_output_request_ids,
                 grammar_output.grammar_bitmask,
             )
-            if not vllm_version_is("0.31.0"):
-                # vLLM main's rejection sampler rejects drafts that were verified
-                # against a permissive grammar row; v0.31.0 has neither the
-                # `invalid_drafts` argument nor the helper that builds it.
-                from vllm.v1.worker.gpu.structured_outputs import grammar_invalid_drafts
+            # Both supported upstream lanes reject drafts checked against a
+            # permissive grammar row.
+            from vllm.v1.worker.gpu.structured_outputs import grammar_invalid_drafts
 
-                invalid_drafts = grammar_invalid_drafts(
-                    input_batch,
-                    grammar_output.structured_output_request_ids,
-                    grammar_output.num_acceptable_drafts,
-                )
+            invalid_drafts = grammar_invalid_drafts(
+                input_batch,
+                grammar_output.structured_output_request_ids,
+                grammar_output.num_acceptable_drafts,
+            )
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
@@ -1155,7 +1155,7 @@ class NPUModelRunner(GPUModelRunner):
                 input_batch,
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
-                *(() if vllm_version_is("0.31.0") else (invalid_drafts,)),
+                invalid_drafts,
             )
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
@@ -1257,7 +1257,7 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def _can_skip_spec_cpu_length_sync(self) -> bool:
-        """Allow device lengths for GLM-5.3 with a DFlash2 draft."""
+        """Allow device lengths when every active speculative backend supports them."""
         if self.sync_spec_pp_cpu_counts:
             return False
 
@@ -1274,7 +1274,28 @@ class NPUModelRunner(GPUModelRunner):
             and "DFlash2DraftModel" in (spec.draft_model_config.architectures or [])
         ):
             return True
-        return False
+        spec = self.speculative_config
+        if (
+            spec is None
+            or self.speculator is None
+            or spec.method != "dspark"
+            or self.model_config.hf_text_config.model_type != "minimax_m3_text"
+            or spec.draft_model_config is None
+            or not {"MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"}.intersection(
+                spec.draft_model_config.architectures or []
+            )
+        ):
+            return False
+
+        backends = [group.backend for groups in self.attn_groups for group in groups]
+        # Keep the target's sparse implementation unchanged: decode uses exact
+        # device lengths; prefill independently reads them for host block counts.
+        # A target GQA layer using the old backend still needs the shared mirror.
+        return AscendFlashAttentionBackend in backends and all(
+            backend is AscendFlashAttentionBackend
+            or backend.get_name() in ("ASCEND_MINIMAX_M3_SPARSE", "ASCEND_MINIMAX_M3_SPARSE_INDEXER")
+            for backend in backends
+        )
 
     def postprocess_sampled(
         self,

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
 
-"""Device-length CANN FlashAttn for A5 V2 DFlash2 eager drafts."""
+"""Device-length CANN FlashAttn for A5 V2 drafts and MiniMax DSpark."""
 
 from dataclasses import dataclass, field
 
 import torch
+from vllm.logger import logger
 
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -67,6 +68,7 @@ class AscendFlashAttentionImpl(AscendAttentionBackendImpl):
         # Load CANN only in workers using this backend.
         from cann_ops_transformer.ops import flash_attn, flash_attn_metadata
 
+        logger.info_once("Using CANN FlashAttn with device lengths for speculative drafts.", scope="process")
         metadata = attn_metadata
         if metadata.flash_attn_lengths is None:
             num_reqs = metadata.block_tables.shape[0]
@@ -77,7 +79,7 @@ class AscendFlashAttentionImpl(AscendAttentionBackendImpl):
             metadata.flash_attn_lengths = boundaries, lengths
 
         layout_kv = "PA_BNBD" if self.use_bnsd_kv_cache else "PA_BBND"
-        plan_key = (self.num_heads, self.num_kv_heads, query.shape[-1], self.sliding_window, layout_kv)
+        plan_key = (self.num_heads, self.num_kv_heads, query.shape[-1], self.sliding_window, layout_kv, metadata.causal)
         cached = metadata.flash_attn_plans.get(plan_key)
         if cached is None:
             window = self.sliding_window - 1 if self.sliding_window is not None else -1

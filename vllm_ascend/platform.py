@@ -403,17 +403,6 @@ class NPUPlatform(Platform):
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Apply Ascend-specific defaults."""
 
-        # Upstream derives this threshold only for CUDA/XPU. Without an Ascend
-        # default, an explicit SP/MMRS request is disabled during VllmConfig
-        # validation before the graph fusion pass can observe it.
-        # vLLM #60517 removed PassConfig.enable_sp/fuse_gemm_comms/
-        # sp_min_token_num on main; the pass-based SP this defaulted no longer
-        # exists there.
-        if vllm_version_is("0.31.0"):
-            pass_config = vllm_config.compilation_config.pass_config
-            if (pass_config.enable_sp or pass_config.fuse_gemm_comms) and pass_config.sp_min_token_num is None:
-                pass_config.sp_min_token_num = 1
-
         # TODO: Remove this memory-saving capture-size override and its ceiling
         # restoration once MC2 is no longer used.
         reduced_cg_cap = _get_reduced_cg_cap(vllm_config)
@@ -570,7 +559,7 @@ class NPUPlatform(Platform):
         # vLLM #61392 folds `compress_ratios` into `layer_types`/`compress_rates`.
         # Restore the legacy field before any runner/model/cache component reads
         # it (e.g. NPUModelRunner.__init__ setting `use_compress`).
-        if not vllm_version_is("0.31.0"):
+        if not vllm_version_is("0.32.0"):
             from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
 
             seen: set[int] = set()
@@ -1402,13 +1391,8 @@ def _setup_compile_backend(
         and requires_tp_aligned_capture_sizes
     ):
         original_sizes = compilation_config.cudagraph_capture_sizes
-        # vLLM #60517 removed `update_sizes_for_sequence_parallelism` on main;
-        # inline its behaviour (keep sizes that are multiples of tp_size).
-        if vllm_version_is("0.31.0"):
-            sp_aclgraph_sizes = vllm_config.update_sizes_for_sequence_parallelism(original_sizes)
-        else:
-            tp_size = vllm_config.parallel_config.tensor_parallel_size
-            sp_aclgraph_sizes = [size for size in original_sizes if size % tp_size == 0]
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        sp_aclgraph_sizes = [size for size in original_sizes if size % tp_size == 0]
         if not sp_aclgraph_sizes:
             raise AssertionError(
                 f"cudagraph_capture_sizes {original_sizes} does not contain"
@@ -1679,6 +1663,8 @@ def _validate_flash_attn_backend(backend_key, selector) -> bool:
     spec = config.speculative_config if config is not None else None
     if spec is None or not spec.enforce_eager:
         return False
+    if backends.model_tag == "dspark_head":
+        return _validate_minimax_dspark_flash_attn(config, selector)
     # V2 keeps the target model_config while loading the draft. Read the live
     # loader tag rather than relying on V1's runner_type="draft" convention.
     if backends.model_tag != "dflash_head":
@@ -1701,6 +1687,40 @@ def _validate_flash_attn_backend(backend_key, selector) -> bool:
             or selector.use_rswa
             or selector.use_batch_invariant
             or selector.use_per_head_quant_scales
+        )
+    )
+
+
+def _validate_minimax_dspark_flash_attn(config, selector) -> bool:
+    """Preserve the MiniMax eager draft guards alongside main's DFlash backend."""
+    from vllm.v1.attention.backend import AttentionType
+
+    spec = config.speculative_config
+    if spec.method != "dspark":
+        return False
+    if spec.target_model_config.hf_text_config.model_type != "minimax_m3_text":
+        return False
+    if not {"MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"}.intersection(
+        spec.draft_model_config.architectures or []
+    ):
+        return False
+    parallel = config.parallel_config
+    return (
+        parallel.pipeline_parallel_size == 1
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.decode_context_parallel_size == 1
+        and not getattr(spec, "enable_adaptive_verification", False)
+        and selector.attn_type == AttentionType.DECODER
+        and selector.dtype in (torch.float16, torch.bfloat16)
+        and selector.kv_cache_dtype in (None, "auto", "float16", "bfloat16")
+        and not (
+            getattr(selector, "use_pcp", False)
+            or selector.use_dcp
+            or selector.use_mm_prefix
+            or selector.use_per_head_quant_scales
+            or selector.use_batch_invariant
+            or getattr(selector, "use_rswa", False)
+            or getattr(selector, "use_adaptive_verification", False)
         )
     )
 

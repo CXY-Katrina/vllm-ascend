@@ -68,7 +68,7 @@ class AscendFlashAttentionImpl(AscendAttentionBackendImpl):
         # Load CANN only in workers using this backend.
         from cann_ops_transformer.ops import flash_attn, flash_attn_metadata
 
-        logger.info_once("Using CANN FlashAttn with device lengths for MiniMax DSpark.", scope="process")
+        logger.info_once("Using CANN FlashAttn with device lengths for speculative drafts.", scope="process")
         metadata = attn_metadata
         if metadata.flash_attn_lengths is None:
             num_reqs = metadata.block_tables.shape[0]

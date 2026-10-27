@@ -59,7 +59,8 @@ def test_minimax_dspark_selection_preserves_parallel_and_dtype_guards(
     selector = AttentionSelectorConfig(head_size=128, block_size=128, dtype=torch.bfloat16, kv_cache_dtype=kv_dtype)
     with set_model_tag("dspark_head"):
         assert platform._validate_flash_attn_backend((False, False, False), selector) is expected
-    with set_model_tag("backbone"):
+    with monkeypatch.context() as target_tag:
+        target_tag.setattr("vllm.compilation.backends.model_tag", "backbone")
         assert not platform._validate_flash_attn_backend((False, False, False), selector)
 
 

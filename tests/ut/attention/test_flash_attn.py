@@ -36,6 +36,33 @@ def make_impl(query, *, num_kv_heads=1, window=None, layout="PA_BBND", sinks=Non
     return impl
 
 
+@pytest.mark.parametrize("architecture", ["MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"])
+@pytest.mark.parametrize("pp,kv_dtype,expected", [(1, "bfloat16", True), (2, "bfloat16", False), (1, "fp8", False)])
+def test_minimax_dspark_selection_preserves_parallel_and_dtype_guards(
+    monkeypatch, architecture, pp, kv_dtype, expected
+):
+    from vllm_ascend import platform
+
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            enforce_eager=True,
+            target_model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="minimax_m3_text")),
+            draft_model_config=SimpleNamespace(architectures=[architecture]),
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp, prefill_context_parallel_size=1, decode_context_parallel_size=1
+        ),
+    )
+    monkeypatch.setattr(platform, "get_current_hardware_profile", lambda: SimpleNamespace(supports=lambda _: True))
+    monkeypatch.setattr("vllm.config.get_current_vllm_config_or_none", lambda: config)
+    selector = AttentionSelectorConfig(head_size=128, block_size=128, dtype=torch.bfloat16, kv_cache_dtype=kv_dtype)
+    with set_model_tag("dspark_head"):
+        assert platform._validate_flash_attn_backend((False, False, False), selector) is expected
+    with set_model_tag("backbone"):
+        assert not platform._validate_flash_attn_backend((False, False, False), selector)
+
+
 @pytest.fixture
 def select_flash_attn(monkeypatch):
     from vllm_ascend import platform

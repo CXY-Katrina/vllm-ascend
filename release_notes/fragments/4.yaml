@@ -1,0 +1,6 @@
+pr: 4
+entries:
+  - category: bugfix
+    text: >-
+      MiniMax-M3 FP8 KV attention uses consistent FP8 softmax precision in CANN GBSA metadata
+      and execution while retaining BF16 precision settings.

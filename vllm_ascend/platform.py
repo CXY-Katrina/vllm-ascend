@@ -1690,6 +1690,7 @@ def _validate_flash_attn_backend(backend_key, selector) -> bool:
         )
     )
 
+
 def _validate_minimax_dspark_flash_attn(config, selector) -> bool:
     """Preserve the MiniMax eager draft guards alongside main's DFlash backend."""
     from vllm.v1.attention.backend import AttentionType
@@ -1699,7 +1700,9 @@ def _validate_minimax_dspark_flash_attn(config, selector) -> bool:
         return False
     if spec.target_model_config.hf_text_config.model_type != "minimax_m3_text":
         return False
-    if not {"MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"}.intersection(spec.draft_model_config.architectures or []):
+    if not {"MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"}.intersection(
+        spec.draft_model_config.architectures or []
+    ):
         return False
     parallel = config.parallel_config
     return (
@@ -1720,7 +1723,6 @@ def _validate_minimax_dspark_flash_attn(config, selector) -> bool:
             or getattr(selector, "use_adaptive_verification", False)
         )
     )
-
 
 
 def _validate_fa3_backend(key, _attn_selector_config):

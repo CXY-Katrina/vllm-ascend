@@ -1,5 +1,0 @@
-pr: 9
-entries:
-  - category: bugfix
-    text: Fixed MiniMax-M3 sparse attention with CANN GBSA by sorting selected block IDs in ascending order while keeping padding at the end.
-    model: minimax-m3

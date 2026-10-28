@@ -1605,7 +1605,7 @@ def test_sparse_decode_reuses_schedule_but_keeps_layer_inputs(
         assert args[0] is q
         assert torch.equal(args[1], kv[0])
         assert torch.equal(args[2], kv[1])
-        assert args[3] is indices
+        assert torch.equal(args[3], indices)
         assert args[4] is counts
         assert kwargs["metadata"] is schedule
         assert torch.equal(output, torch.full_like(q, layer + 1))

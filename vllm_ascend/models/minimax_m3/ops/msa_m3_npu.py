@@ -265,7 +265,12 @@ def _run_generic_block_sparse_attention(
 ) -> torch.Tensor:
     """Run MiniMax-M3 sparse attention through CANN Ops GBSA."""
     del dequant_scale
-    topk_idx = topk_idx.to(dtype=torch.int32).contiguous()
+    # CANN GBSA requires an ascending, nonnegative valid prefix.
+    # Preserve the selected set and keep -1 padding after all valid blocks.
+    topk_idx = topk_idx.to(dtype=torch.int32)
+    invalid_block = torch.iinfo(torch.int32).max
+    topk_idx = topk_idx.masked_fill(topk_idx < 0, invalid_block).sort(dim=-1).values
+    topk_idx = topk_idx.masked_fill(topk_idx == invalid_block, -1).contiguous()
     select_num_idx = select_num_idx.to(dtype=torch.int32).contiguous()
     block_table = block_table.to(dtype=torch.int32).contiguous()
     cu_seqlens_q = cu_seqlens_q.to(dtype=torch.int64).contiguous()

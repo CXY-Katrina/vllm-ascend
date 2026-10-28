@@ -1448,6 +1448,8 @@ def test_sparse_attn_prefill_kv_gather_q_forwards_csr_metadata(
     assert torch.equal(output, torch.ones_like(output))
 
 
+@pytest.mark.parametrize("reverse_indices", [False, True])
+@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("reuse_prefix", [False, True])
 @pytest.mark.parametrize("device_type", [AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5])
 def test_sparse_attn_decode_npu_forwards_runtime_metadata(
@@ -1455,17 +1457,23 @@ def test_sparse_attn_decode_npu_forwards_runtime_metadata(
     monkeypatch: pytest.MonkeyPatch,
     reuse_prefix: bool,
     device_type: AscendDeviceType,
+    reverse_indices: bool,
+    indices_dtype: torch.dtype,
 ) -> None:
     monkeypatch.setattr(msa_m3_npu_module, "get_current_hardware_profile", lambda: get_hardware_profile(device_type))
     q = torch.zeros(4, 2, 4, dtype=torch.bfloat16)
     kv_cache = torch.zeros(2, 6, 128, 2, 4, dtype=torch.bfloat16)
-    topk_idx = torch.tensor(
+    expected_topk_idx = torch.tensor(
         [
             [[0, 1], [0, -1], [2, 3], [-1, -1]],
             [[0, 1], [1, -1], [2, 3], [3, -1]],
         ],
         dtype=torch.int32,
     )
+    topk_idx = expected_topk_idx.to(indices_dtype)
+    if reverse_indices:
+        topk_idx = topk_idx.flip(-1)
+    original_topk_idx = topk_idx.clone()
     block_table = torch.arange(8, dtype=torch.int32).view(2, 4)
     seq_lens = torch.tensor([129, 385], dtype=torch.int32)
     output = torch.empty_like(q)
@@ -1501,7 +1509,9 @@ def test_sparse_attn_decode_npu_forwards_runtime_metadata(
         assert gbsa_metadata_op.call_args.kwargs["cu_seqlens_q"] is prefix
     metadata_args = gbsa_metadata_op.call_args.args
     metadata_kwargs = gbsa_metadata_op.call_args.kwargs
-    assert torch.equal(metadata_args[0], topk_idx)
+    assert torch.equal(metadata_args[0], expected_topk_idx)
+    assert metadata_args[0].dtype == torch.int32
+    assert metadata_args[0].is_contiguous()
     assert torch.equal(
         metadata_args[1],
         torch.tensor([[2, 1, 2, 0], [2, 1, 2, 1]], dtype=torch.int32),
@@ -1524,7 +1534,8 @@ def test_sparse_attn_decode_npu_forwards_runtime_metadata(
     args = gbsa_attention_op.call_args.args
     kwargs = gbsa_attention_op.call_args.kwargs
     assert args[0] is q
-    assert torch.equal(args[3], topk_idx)
+    assert torch.equal(args[3], expected_topk_idx)
+    assert torch.equal(topk_idx, original_topk_idx)
     assert torch.equal(args[4], metadata_args[1])
     assert args[5] == [1, 128]
     assert kwargs["metadata"] is metadata
@@ -2057,11 +2068,13 @@ def test_sparse_attn_prefill_a5_uses_fp8_inputs(
         (AscendDeviceType.A5, torch.float8_e4m3fn),
     ],
 )
+@pytest.mark.parametrize("reverse_indices", [False, True])
 @pytest.mark.parametrize("cache_layout", ["tensor", "tuple", "list"])
 def test_sparse_attn_prefill_missing_split_kv_uses_cann_gbsa(
     device_type,
     dtype,
     cache_layout,
+    reverse_indices,
     mock_gbsa_ops: tuple[MagicMock, MagicMock],
 ) -> None:
     q = torch.tensor([[[500.0, -500.0, 1.0, -1.0]]] * 5, dtype=torch.bfloat16)
@@ -2069,7 +2082,9 @@ def test_sparse_attn_prefill_missing_split_kv_uses_cann_gbsa(
     kv_cache = cache if cache_layout == "tensor" else (cache[0], cache[1])
     if cache_layout == "list":
         kv_cache = list(kv_cache)
-    topk_idx = torch.tensor([[[0, -1]]] * 5, dtype=torch.int32)
+    expected_topk_idx = torch.tensor([[[0, 1, -1]]] * 2 + [[[0, -1, -1]]] * 3, dtype=torch.int32)
+    topk_idx = expected_topk_idx.flip(-1) if reverse_indices else expected_topk_idx.clone()
+    original_topk_idx = topk_idx.clone()
     output = torch.empty_like(q)
     metadata = torch.empty(1024, dtype=torch.int32)
     gbsa_metadata_op, gbsa_attention_op = mock_gbsa_ops
@@ -2110,8 +2125,9 @@ def test_sparse_attn_prefill_missing_split_kv_uses_cann_gbsa(
     assert args[0].dtype == dtype
     assert args[1].dtype == dtype
     assert args[2].dtype == dtype
-    assert args[3] is topk_idx
-    torch.testing.assert_close(args[4], torch.ones(5, 1, dtype=torch.int32))
+    assert torch.equal(args[3], expected_topk_idx)
+    assert torch.equal(topk_idx, original_topk_idx)
+    torch.testing.assert_close(args[4], torch.tensor([[2], [2], [1], [1], [1]], dtype=torch.int32))
     assert kwargs["metadata"] is metadata
     assert kwargs["softmax_precision"] == metadata_kwargs["softmax_precision"]
     if dtype == torch.float8_e4m3fn:

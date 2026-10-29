@@ -1801,10 +1801,11 @@ def test_sparse_builder_prepares_gbsa_before_layers_and_refreshes_in_place(query
     assert len(buffers) == 2 and torch.all(preallocated == 3)
 
 
+@pytest.mark.parametrize("set_graph_pad_size", [True, False])
 @pytest.mark.parametrize("query_len", [1, 4])
 @pytest.mark.parametrize("actual_reqs,padded_reqs", [(1, 2), (3, 4), (15, 16)])
 def test_sparse_builder_refreshes_captured_gbsa_buffer_for_padded_decode(
-    query_len, actual_reqs, padded_reqs, mock_gbsa_ops, monkeypatch
+    query_len, actual_reqs, padded_reqs, set_graph_pad_size, mock_gbsa_ops, monkeypatch
 ):
     metadata_op, _ = mock_gbsa_ops
     monkeypatch.setattr(
@@ -1824,7 +1825,7 @@ def test_sparse_builder_refreshes_captured_gbsa_buffer_for_padded_decode(
     captured_common = _create_common_attn_metadata(
         BatchSpec([128] * padded_reqs, [query_len] * padded_reqs), 128, torch.device("cpu")
     )
-    captured_common.graph_pad_size = padded_reqs * query_len
+    captured_common.graph_pad_size = padded_reqs * query_len if set_graph_pad_size else -1
     captured = builder.build(0, captured_common).decode
     buffer = next(iter(captured.gbsa_metadata_cache.values()))
     runtime_common = _create_common_attn_metadata(
@@ -1835,7 +1836,7 @@ def test_sparse_builder_refreshes_captured_gbsa_buffer_for_padded_decode(
         128,
         torch.device("cpu"),
     )
-    runtime_common.graph_pad_size = padded_reqs * query_len
+    runtime_common.graph_pad_size = padded_reqs * query_len if set_graph_pad_size else -1
     runtime_common.num_input_tokens = padded_reqs * query_len
     runtime = builder.build(0, runtime_common).decode
     assert runtime.seq_lens.numel() == actual_reqs
@@ -2221,7 +2222,7 @@ def test_ascendc_index_decode_uses_full_cache_without_tp_collectives(
 ) -> None:
     # Exercise metadata and forward together: an unguarded metadata, dummy,
     # or forward TP branch must fail even when the other branches are correct.
-    monkeypatch.setattr(msa_m3_module, "get_ascend_device_type", lambda: device_type)
+    monkeypatch.setattr(msa_m3_module, "get_current_hardware_profile", lambda: get_hardware_profile(device_type))
     monkeypatch.setattr(msa_m3_module, "_USE_ASCENDC_INDEX_SCORE_DECODE", True)
     monkeypatch.setattr(msa_m3_module, "_USE_ASCENDC_INDEX_SCORE_PREFILL", True)
     group = SimpleNamespace(world_size=tp_size, rank_in_group=0, all_gather=MagicMock())
@@ -2280,3 +2281,32 @@ def test_ascendc_index_decode_uses_full_cache_without_tp_collectives(
     assert prefill_op.call_count == 2 * num_prefills
     forbidden.assert_not_called()
     group.all_gather.assert_not_called()
+
+
+@pytest.mark.parametrize("query_len", [1, 4])
+@pytest.mark.parametrize("mode", ["mixed", "piecewise", "eager"])
+def test_sparse_schedule_ignores_prefill_and_token_only_padding(query_len, mode, mock_gbsa_ops, monkeypatch):
+    metadata_op, _ = mock_gbsa_ops
+    monkeypatch.setattr(
+        msa_m3_module, "get_current_hardware_profile", lambda: get_hardware_profile(AscendDeviceType.A3)
+    )
+    mixed = mode == "mixed"
+    monkeypatch.setattr(
+        msa_m3_module, "split_decodes_and_prefills", lambda *a, **k: (2, int(mixed), 2 * query_len, 8 if mixed else 0)
+    )
+    common = _create_common_attn_metadata(
+        BatchSpec([128, 257] + ([512] if mixed else []), [query_len, query_len] + ([8] if mixed else [])),
+        128,
+        torch.device("cpu"),
+    )
+    common.graph_pad_size = -1
+    common.num_input_tokens = 64
+    builder = _make_sparse_builder(torch.device("cpu"))
+    md = builder.build(0, common)
+    assert md.num_prefills == int(mixed)
+    assert md.num_decodes == 2
+    assert md.decode.seq_lens.numel() == 2
+    assert metadata_op.call_args.args[0].shape == (2, 2 * query_len, 16)
+    assert metadata_op.call_args.kwargs["cu_seqlens_q"].shape == (3,)
+    expected = _decode_gbsa_block_counts(common.seq_lens[:2], query_len, 2, 16, common.block_table_tensor.shape[-1])
+    torch.testing.assert_close(metadata_op.call_args.args[1], expected, rtol=0, atol=0)

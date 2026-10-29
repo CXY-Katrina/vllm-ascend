@@ -759,6 +759,8 @@ class AscendMiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[AscendMiniMa
         self,
         metadata: AscendMiniMaxM3SparseDecodeMetadata,
         common_attn_metadata: CommonAttentionMetadata,
+        *,
+        num_prefills: int = 0,
     ) -> None:
         if metadata.decode_query_len not in _GBSA_DECODE_QUERY_LENGTHS or metadata.seq_lens.numel() == 0:
             return
@@ -766,9 +768,14 @@ class AscendMiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[AscendMiniMa
         assert metadata.gbsa_metadata_cache is not None
         seq_lens = metadata.seq_lens
         cu_seqlens_q = metadata.cu_seqlens_q
-        if getattr(common_attn_metadata, "graph_pad_size", -1) > 0:
+        if num_prefills == 0 and (
+            getattr(common_attn_metadata, "graph_pad_size", -1) > 0
+            or common_attn_metadata.num_reqs > metadata.seq_lens.numel()
+        ):
             # FULL graphs retain the schedule for their padded query shape.
-            # Updating an unpadded shape would leave that captured buffer stale.
+            # MRV2 pads the request dimension without setting graph_pad_size.
+            # Piecewise/eager keep the actual request count. Mixed batches
+            # include prefill requests and must keep the decode-only schedule.
             num_reqs = common_attn_metadata.num_reqs
             seq_lens = common_attn_metadata.seq_lens[:num_reqs]
             cu_seqlens_q = self._get_decode_cu_seqlens_q(num_reqs, metadata.decode_query_len)
@@ -877,7 +884,7 @@ class AscendMiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[AscendMiniMa
                 gbsa_metadata_cache={} if self.reuse_decode_gbsa_metadata else None,
             )
             if self.decode_gbsa_configs:
-                self._prepare_decode_gbsa_metadata(decode_metadata, common_attn_metadata)
+                self._prepare_decode_gbsa_metadata(decode_metadata, common_attn_metadata, num_prefills=num_prefills)
 
         return AscendMiniMaxM3SparseMetadata(
             seq_lens=seq_lens,
